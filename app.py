@@ -28,11 +28,13 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Rate limiting: Conservative 5 requests per second to stay safely under 10 req/s limit
-RATE_LIMIT = 5
+# Rate limiting: Very conservative 3 requests per second to stay safely under 10 req/s limit
+RATE_LIMIT = 3
 REQUEST_INTERVAL = 1.0 / RATE_LIMIT
 # Additional delay between processing each wallet to avoid burst rate limits
-WALLET_PROCESSING_DELAY = 0.3  # seconds between wallets
+WALLET_PROCESSING_DELAY = 0.5  # seconds between wallets
+# Delay between different API calls within the same wallet
+API_CALL_DELAY = 0.2  # seconds between different API calls for same wallet
 
 # Initialize session state for rate limiting
 if 'last_request_time' not in st.session_state:
@@ -42,7 +44,7 @@ if 'request_count' not in st.session_state:
 
 
 def rate_limit():
-    """Enforce rate limiting (conservative 5 req/s)"""
+    """Enforce rate limiting (conservative 3 req/s)"""
     current_time = time.time()
     time_since_last = current_time - st.session_state.last_request_time
     
@@ -239,12 +241,16 @@ def process_wallet_data(addresses: List[str], date_start: datetime, date_end: da
         
         # Fetch user state
         user_state = fetch_user_state(info, address)
+        time.sleep(API_CALL_DELAY)  # Delay between API calls
         
         # Fetch fills
         fills = fetch_user_fills(info, address)
+        time.sleep(API_CALL_DELAY)  # Delay between API calls
         
         # Fetch historical orders to get BuilderCode (cloid) information and order types
         orders = fetch_user_historical_orders(info, address) if builder_code or fills else None
+        if orders is not None:
+            time.sleep(API_CALL_DELAY)  # Delay after orders call
         
         # Match fills to orders and filter by BuilderCode if provided
         if fills and orders:
@@ -314,6 +320,8 @@ def process_wallet_data(addresses: List[str], date_start: datetime, date_end: da
         start_time_ms = int(date_start.timestamp() * 1000)
         end_time_ms = int(date_end.timestamp() * 1000)
         funding = fetch_user_funding(info, address, start_time_ms, end_time_ms)
+        if funding is not None:
+            time.sleep(API_CALL_DELAY)  # Delay after funding call
         if funding:
             for fund in funding:
                 fund['wallet'] = address

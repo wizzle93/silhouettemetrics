@@ -243,12 +243,34 @@ def process_wallet_data(addresses: List[str], date_start: datetime, date_end: da
         # Fetch fills
         fills = fetch_user_fills(info, address)
         
-        # Fetch historical orders to get BuilderCode (cloid) information
+        # Fetch historical orders to get BuilderCode (cloid) information and order types
         orders = fetch_user_historical_orders(info, address) if builder_code or fills else None
         
         # Match fills to orders and filter by BuilderCode if provided
         if fills and orders:
             fills = match_fills_to_orders(fills, orders, builder_code)
+            
+            # Extract order type from orders and add to fills
+            oid_to_order_type = {}
+            for order in orders:
+                order_obj = order.get('order', {}) if isinstance(order, dict) else {}
+                oid = order_obj.get('oid')
+                # Extract order type (limit, market, etc.)
+                if 'orderType' in order_obj:
+                    oid_to_order_type[oid] = order_obj['orderType']
+                elif 'tif' in order_obj:  # Time in force
+                    oid_to_order_type[oid] = order_obj.get('tif', 'Unknown')
+                else:
+                    oid_to_order_type[oid] = 'Unknown'
+            
+            # Add order type to fills
+            for fill in fills:
+                oid = fill.get('oid')
+                fill['order_type'] = oid_to_order_type.get(oid, 'Unknown')
+        elif fills:
+            # If no orders but we have fills, set order_type to Unknown
+            for fill in fills:
+                fill['order_type'] = 'Unknown'
         
         if fills:
             for fill in fills:
@@ -259,6 +281,33 @@ def process_wallet_data(addresses: List[str], date_start: datetime, date_end: da
                     fill['timestamp'] = pd.to_datetime(fill['time'], unit='ms')
                 elif 'timestamp' in fill:
                     fill['timestamp'] = pd.to_datetime(fill['timestamp'], unit='ms')
+                
+                # Calculate trade size in USDC (sz * px)
+                if 'sz' in fill and 'px' in fill:
+                    try:
+                        sz = float(fill.get('sz', 0))
+                        px = float(fill.get('px', 0))
+                        fill['trade_size_usdc'] = abs(sz * px)  # Use abs to handle both long/short
+                    except (ValueError, TypeError):
+                        fill['trade_size_usdc'] = 0
+                else:
+                    fill['trade_size_usdc'] = 0
+                
+                # Extract coin/asset if available
+                if 'coin' in fill:
+                    fill['asset'] = fill['coin']
+                elif 'asset' not in fill:
+                    fill['asset'] = 'Unknown'
+                
+                # Extract side (buy/sell) if available
+                if 'side' in fill:
+                    fill['trade_side'] = fill['side']
+                elif 'closedPnl' in fill:
+                    # Infer from closedPnl if available
+                    fill['trade_side'] = 'Close' if fill.get('closedPnl') else 'Open'
+                else:
+                    fill['trade_side'] = 'Unknown'
+                    
             all_fills.extend(fills)
         
         # Fetch funding (convert datetime to milliseconds timestamp)
@@ -274,6 +323,16 @@ def process_wallet_data(addresses: List[str], date_start: datetime, date_end: da
                     fund['timestamp'] = pd.to_datetime(fund['time'], unit='ms')
                 elif 'timestamp' in fund:
                     fund['timestamp'] = pd.to_datetime(fund['timestamp'], unit='ms')
+                
+                # Extract funding amount (usually negative for fees paid)
+                if 'funding' in fund:
+                    try:
+                        fund['funding_amount'] = float(fund['funding'])
+                    except (ValueError, TypeError):
+                        fund['funding_amount'] = 0
+                else:
+                    fund['funding_amount'] = 0
+                    
             all_funding.extend(funding)
         
         # Store wallet metadata
@@ -359,10 +418,18 @@ def calculate_activity_metrics(df: pd.DataFrame) -> Dict:
     # Volume calculation (if available in fills)
     if 'data_type' in df.columns:
         fills_df = df[df['data_type'] == 'fill']
-        if not fills_df.empty and 'sz' in fills_df.columns and 'px' in fills_df.columns:
-            fills_df['volume'] = pd.to_numeric(fills_df['sz'], errors='coerce') * pd.to_numeric(fills_df['px'], errors='coerce')
-            metrics['total_volume'] = fills_df['volume'].sum()
-            metrics['volume_per_wallet'] = fills_df.groupby('wallet')['volume'].sum().reset_index()
+        if not fills_df.empty:
+            # Use trade_size_usdc if available, otherwise calculate from sz * px
+            if 'trade_size_usdc' in fills_df.columns:
+                metrics['total_volume'] = fills_df['trade_size_usdc'].sum()
+                metrics['volume_per_wallet'] = fills_df.groupby('wallet')['trade_size_usdc'].sum().reset_index(name='volume')
+            elif 'sz' in fills_df.columns and 'px' in fills_df.columns:
+                fills_df['volume'] = pd.to_numeric(fills_df['sz'], errors='coerce') * pd.to_numeric(fills_df['px'], errors='coerce')
+                metrics['total_volume'] = fills_df['volume'].sum()
+                metrics['volume_per_wallet'] = fills_df.groupby('wallet')['volume'].sum().reset_index()
+            else:
+                metrics['total_volume'] = 0
+                metrics['volume_per_wallet'] = pd.DataFrame()
         else:
             metrics['total_volume'] = 0
             metrics['volume_per_wallet'] = pd.DataFrame()
@@ -384,6 +451,138 @@ def calculate_activity_metrics(df: pd.DataFrame) -> Dict:
         metrics['new_wallets_over_time'] = pd.DataFrame()
     
     return metrics
+
+
+def calculate_asset_popularity(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate asset/market popularity rankings based on trade counts and volume"""
+    if df.empty or 'data_type' not in df.columns:
+        return pd.DataFrame()
+    
+    fills_df = df[df['data_type'] == 'fill']
+    if fills_df.empty or 'asset' not in fills_df.columns:
+        return pd.DataFrame()
+    
+    # Count trades per asset
+    asset_stats = fills_df.groupby('asset').agg({
+        'wallet': 'count',  # Number of trades
+        'trade_size_usdc': ['sum', 'mean', 'count']  # Total volume, avg size, count
+    }).reset_index()
+    
+    # Flatten column names
+    asset_stats.columns = ['asset', 'trade_count', 'total_volume', 'avg_trade_size', 'volume_count']
+    
+    # Calculate total volume properly
+    if 'trade_size_usdc' in fills_df.columns:
+        asset_volume = fills_df.groupby('asset')['trade_size_usdc'].sum().reset_index(name='total_volume_usdc')
+        asset_stats = asset_stats.merge(asset_volume, on='asset', how='left')
+        asset_stats['total_volume_usdc'] = asset_stats['total_volume_usdc'].fillna(0)
+    else:
+        asset_stats['total_volume_usdc'] = 0
+    
+    # Sort by trade count (popularity)
+    asset_stats = asset_stats.sort_values('trade_count', ascending=False).reset_index(drop=True)
+    asset_stats['rank'] = range(1, len(asset_stats) + 1)
+    
+    return asset_stats[['rank', 'asset', 'trade_count', 'total_volume_usdc', 'avg_trade_size']]
+
+
+def calculate_order_type_activity(df: pd.DataFrame) -> Dict:
+    """Calculate activity breakdown by order type"""
+    if df.empty or 'data_type' not in df.columns:
+        return {}
+    
+    fills_df = df[df['data_type'] == 'fill']
+    if fills_df.empty or 'order_type' not in fills_df.columns:
+        return {}
+    
+    order_type_stats = fills_df.groupby('order_type').agg({
+        'wallet': 'count',
+        'trade_size_usdc': 'sum'
+    }).reset_index()
+    order_type_stats.columns = ['order_type', 'count', 'total_volume']
+    
+    # Calculate percentages
+    total_count = order_type_stats['count'].sum()
+    if total_count > 0:
+        order_type_stats['percentage'] = (order_type_stats['count'] / total_count) * 100
+    else:
+        order_type_stats['percentage'] = 0
+    
+    order_type_stats = order_type_stats.sort_values('count', ascending=False).reset_index(drop=True)
+    
+    return {
+        'order_types': order_type_stats,
+        'total_orders': total_count
+    }
+
+
+def calculate_fees_and_funding(df: pd.DataFrame) -> Dict:
+    """Calculate total fees and funding costs"""
+    if df.empty:
+        return {}
+    
+    metrics = {}
+    
+    # Calculate funding costs from funding events
+    if 'data_type' in df.columns:
+        funding_df = df[df['data_type'] == 'funding']
+        if not funding_df.empty and 'funding_amount' in funding_df.columns:
+            metrics['total_funding'] = funding_df['funding_amount'].sum()
+            metrics['funding_count'] = len(funding_df)
+            metrics['avg_funding'] = funding_df['funding_amount'].mean() if len(funding_df) > 0 else 0
+            metrics['funding_per_wallet'] = funding_df.groupby('wallet')['funding_amount'].sum().reset_index()
+        else:
+            metrics['total_funding'] = 0
+            metrics['funding_count'] = 0
+            metrics['avg_funding'] = 0
+            metrics['funding_per_wallet'] = pd.DataFrame()
+    
+    # Note: Trade fees are typically included in the fill price, so we'd need additional API calls
+    # to get exact fee breakdown. For now, we focus on funding costs.
+    
+    return metrics
+
+
+def calculate_position_duration(wallet_metadata: List[Dict], df: pd.DataFrame) -> Dict:
+    """Calculate average position holding time"""
+    # This is a simplified calculation - in reality, we'd need to track position opens/closes
+    # For now, we'll estimate based on time between fills for the same asset
+    if df.empty or 'data_type' not in df.columns or 'timestamp' not in df.columns:
+        return {}
+    
+    fills_df = df[df['data_type'] == 'fill'].copy()
+    if fills_df.empty or 'asset' not in fills_df.columns:
+        return {}
+    
+    # Group by wallet and asset, calculate time between first and last trade
+    position_durations = []
+    for (wallet, asset), group in fills_df.groupby(['wallet', 'asset']):
+        if len(group) > 1:
+            group = group.sort_values('timestamp')
+            first_trade = group.iloc[0]['timestamp']
+            last_trade = group.iloc[-1]['timestamp']
+            duration = (last_trade - first_trade).total_seconds() / 3600  # Convert to hours
+            position_durations.append({
+                'wallet': wallet,
+                'asset': asset,
+                'duration_hours': duration,
+                'trade_count': len(group)
+            })
+    
+    if not position_durations:
+        return {
+            'avg_duration_hours': 0,
+            'median_duration_hours': 0,
+            'position_data': pd.DataFrame()
+        }
+    
+    duration_df = pd.DataFrame(position_durations)
+    
+    return {
+        'avg_duration_hours': duration_df['duration_hours'].mean(),
+        'median_duration_hours': duration_df['duration_hours'].median(),
+        'position_data': duration_df
+    }
 
 
 def analyze_drop_offs(df: pd.DataFrame) -> Dict:
@@ -513,6 +712,12 @@ if fetch_button:
     activity_metrics = calculate_activity_metrics(df)
     drop_off_analysis = analyze_drop_offs(df)
     
+    # Calculate new metrics
+    asset_popularity = calculate_asset_popularity(df)
+    order_type_activity = calculate_order_type_activity(df)
+    fees_funding = calculate_fees_and_funding(df)
+    position_duration = calculate_position_duration(wallet_metadata, df)
+    
     # Metrics columns
     col1, col2, col3, col4 = st.columns(4)
     
@@ -528,6 +733,41 @@ if fetch_button:
     with col4:
         total_volume = activity_metrics.get('total_volume', 0)
         st.metric("Total Volume", f"${total_volume:,.2f}" if total_volume > 0 else "N/A")
+    
+    # Additional metrics row
+    col5, col6, col7, col8 = st.columns(4)
+    
+    with col5:
+        avg_trade_size = 0
+        if not df.empty and 'data_type' in df.columns:
+            fills_df = df[df['data_type'] == 'fill']
+            if 'trade_size_usdc' in fills_df.columns:
+                avg_trade_size = fills_df['trade_size_usdc'].mean()
+        st.metric("Avg Trade Size (USDC)", f"${avg_trade_size:,.2f}" if avg_trade_size > 0 else "N/A")
+    
+    with col6:
+        total_funding = fees_funding.get('total_funding', 0)
+        st.metric("Total Funding Paid", f"${total_funding:,.2f}" if total_funding != 0 else "N/A")
+    
+    with col7:
+        avg_duration = position_duration.get('avg_duration_hours', 0)
+        if avg_duration > 0:
+            if avg_duration < 24:
+                duration_str = f"{avg_duration:.1f} hrs"
+            elif avg_duration < 168:  # 7 days
+                duration_str = f"{avg_duration/24:.1f} days"
+            else:
+                duration_str = f"{avg_duration/168:.1f} weeks"
+            st.metric("Avg Position Duration", duration_str)
+        else:
+            st.metric("Avg Position Duration", "N/A")
+    
+    with col8:
+        if not asset_popularity.empty:
+            top_asset = asset_popularity.iloc[0]['asset'] if len(asset_popularity) > 0 else "N/A"
+            st.metric("Most Popular Asset", top_asset)
+        else:
+            st.metric("Most Popular Asset", "N/A")
     
     # Analysis sections
     if analysis_type in ["Demographics", "Both"]:
@@ -670,6 +910,204 @@ if fetch_button:
             fig.update_xaxes(title="Volume (USD)")
             fig.update_yaxes(title="")
             st.plotly_chart(fig, use_container_width=True)
+        
+        # Asset/Market Popularity Rankings
+        if not asset_popularity.empty:
+            st.subheader("📈 Asset/Market Popularity Rankings")
+            top_assets = asset_popularity.head(20)
+            
+            # Create visualization
+            fig = px.bar(
+                top_assets,
+                x='trade_count',
+                y='asset',
+                orientation='h',
+                title="Top 20 Assets by Trade Count",
+                labels={'trade_count': 'Number of Trades', 'asset': 'Asset'},
+                text='trade_count',
+                hover_data={'total_volume_usdc': True, 'rank': True}
+            )
+            fig.update_traces(texttemplate='%{text}', textposition='outside')
+            fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+            fig.update_xaxes(title="Trade Count")
+            fig.update_yaxes(title="")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Also show volume-based ranking
+            st.subheader("Top Assets by Trading Volume (USDC)")
+            top_volume = asset_popularity.nlargest(20, 'total_volume_usdc')
+            fig = px.bar(
+                top_volume,
+                x='total_volume_usdc',
+                y='asset',
+                orientation='h',
+                title="Top 20 Assets by Trading Volume",
+                labels={'total_volume_usdc': 'Volume (USDC)', 'asset': 'Asset'},
+                text='total_volume_usdc'
+            )
+            fig.update_traces(texttemplate='$%{text:,.0f}', textposition='outside')
+            fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+            fig.update_xaxes(title="Volume (USDC)")
+            fig.update_yaxes(title="")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Display table
+            st.subheader("Asset Rankings Table")
+            display_df = asset_popularity.head(20)[['rank', 'asset', 'trade_count', 'total_volume_usdc', 'avg_trade_size']].copy()
+            display_df['total_volume_usdc'] = display_df['total_volume_usdc'].apply(lambda x: f"${x:,.2f}" if x > 0 else "$0.00")
+            display_df['avg_trade_size'] = display_df['avg_trade_size'].apply(lambda x: f"${x:,.2f}" if x > 0 else "$0.00")
+            st.dataframe(display_df, use_container_width=True)
+        
+        # Order Type Activity
+        if order_type_activity and order_type_activity.get('order_types') is not None:
+            st.subheader("📋 Order Type Activity")
+            order_types_df = order_type_activity['order_types']
+            
+            if not order_types_df.empty:
+                # Pie chart
+                fig = px.pie(
+                    order_types_df,
+                    values='count',
+                    names='order_type',
+                    title="Distribution by Order Type",
+                    hover_data=['percentage']
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Bar chart
+                fig = px.bar(
+                    order_types_df,
+                    x='order_type',
+                    y='count',
+                    title="Order Type Usage",
+                    labels={'order_type': 'Order Type', 'count': 'Number of Orders'},
+                    text='count'
+                )
+                fig.update_traces(texttemplate='%{text}', textposition='outside')
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Display table
+                st.subheader("Order Type Statistics")
+                display_df = order_types_df[['order_type', 'count', 'percentage', 'total_volume']].copy()
+                display_df['percentage'] = display_df['percentage'].apply(lambda x: f"{x:.1f}%")
+                display_df['total_volume'] = display_df['total_volume'].apply(lambda x: f"${x:,.2f}" if x > 0 else "$0.00")
+                st.dataframe(display_df, use_container_width=True)
+        
+        # Trade Size Distribution
+        if not df.empty and 'data_type' in df.columns:
+            fills_df = df[df['data_type'] == 'fill']
+            if 'trade_size_usdc' in fills_df.columns and not fills_df['trade_size_usdc'].empty:
+                st.subheader("💰 Trade Size Distribution (USDC)")
+                trade_sizes = fills_df['trade_size_usdc'][fills_df['trade_size_usdc'] > 0]
+                
+                if not trade_sizes.empty:
+                    # Histogram
+                    fig = px.histogram(
+                        trade_sizes,
+                        nbins=30,
+                        title="Distribution of Trade Sizes",
+                        labels={'value': 'Trade Size (USDC)', 'count': 'Number of Trades'}
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Statistics
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Min Trade Size", f"${trade_sizes.min():,.2f}")
+                    with col2:
+                        st.metric("Max Trade Size", f"${trade_sizes.max():,.2f}")
+                    with col3:
+                        st.metric("Median Trade Size", f"${trade_sizes.median():,.2f}")
+                    with col4:
+                        st.metric("Mean Trade Size", f"${trade_sizes.mean():,.2f}")
+        
+        # Position Duration Analysis
+        if position_duration and position_duration.get('position_data') is not None:
+            pos_data = position_duration['position_data']
+            if not pos_data.empty:
+                st.subheader("⏱️ Position Duration Analysis")
+                
+                # Show average and median
+                col1, col2 = st.columns(2)
+                with col1:
+                    avg_hours = position_duration.get('avg_duration_hours', 0)
+                    if avg_hours > 0:
+                        if avg_hours < 24:
+                            st.metric("Average Position Duration", f"{avg_hours:.1f} hours")
+                        elif avg_hours < 168:
+                            st.metric("Average Position Duration", f"{avg_hours/24:.1f} days")
+                        else:
+                            st.metric("Average Position Duration", f"{avg_hours/168:.1f} weeks")
+                    else:
+                        st.metric("Average Position Duration", "N/A")
+                
+                with col2:
+                    median_hours = position_duration.get('median_duration_hours', 0)
+                    if median_hours > 0:
+                        if median_hours < 24:
+                            st.metric("Median Position Duration", f"{median_hours:.1f} hours")
+                        elif median_hours < 168:
+                            st.metric("Median Position Duration", f"{median_hours/24:.1f} days")
+                        else:
+                            st.metric("Median Position Duration", f"{median_hours/168:.1f} weeks")
+                    else:
+                        st.metric("Median Position Duration", "N/A")
+                
+                # Histogram of position durations
+                fig = px.histogram(
+                    pos_data,
+                    x='duration_hours',
+                    nbins=30,
+                    title="Distribution of Position Durations",
+                    labels={'duration_hours': 'Duration (Hours)', 'count': 'Number of Positions'}
+                )
+                st.plotly_chart(fig, use_container_width=True)
+        
+        # Fees and Funding Analysis
+        if fees_funding and fees_funding.get('total_funding') is not None:
+            st.subheader("💸 Fees & Funding Analysis")
+            
+            total_funding = fees_funding.get('total_funding', 0)
+            funding_count = fees_funding.get('funding_count', 0)
+            avg_funding = fees_funding.get('avg_funding', 0)
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Funding Paid", f"${total_funding:,.2f}" if total_funding != 0 else "$0.00")
+            with col2:
+                st.metric("Funding Events", funding_count)
+            with col3:
+                st.metric("Avg Funding per Event", f"${avg_funding:,.2f}" if avg_funding != 0 else "$0.00")
+            
+            # Funding per wallet
+            funding_per_wallet = fees_funding.get('funding_per_wallet', pd.DataFrame())
+            if not funding_per_wallet.empty:
+                st.subheader("Funding Paid per Wallet")
+                funding_per_wallet = funding_per_wallet.sort_values('funding_amount', ascending=False).head(20)
+                
+                funding_per_wallet['wallet_short'] = funding_per_wallet['wallet'].apply(
+                    lambda addr: f"{addr[:8]}...{addr[-6:]}" if len(addr) > 14 else addr
+                )
+                funding_per_wallet['wallet_label'] = [
+                    f"#{i+1}: {short}" 
+                    for i, short in enumerate(funding_per_wallet['wallet_short'])
+                ]
+                
+                fig = px.bar(
+                    funding_per_wallet,
+                    x='funding_amount',
+                    y='wallet_label',
+                    orientation='h',
+                    title="Funding Paid per Wallet (Top 20)",
+                    labels={'funding_amount': 'Funding Amount (USDC)', 'wallet_label': 'Wallet Address'},
+                    hover_data={'wallet': True},
+                    text='funding_amount'
+                )
+                fig.update_traces(texttemplate='$%{text:,.2f}', textposition='outside')
+                fig.update_layout(yaxis={'categoryorder': 'total ascending'})
+                fig.update_xaxes(title="Funding Amount (USDC)")
+                fig.update_yaxes(title="")
+                st.plotly_chart(fig, use_container_width=True)
     
     # Drop-off analysis
     if drop_off_analysis:

@@ -92,9 +92,39 @@ The dashboard enforces rate limiting (10 requests/second) to comply with API lim
 - plotly >= 5.17.0
 - hyperliquid-python-sdk >= 1.0.0
 
+## Authentication
+
+The dashboard is password-protected. To set up authentication:
+
+### For Streamlit Cloud Deployment:
+
+1. Go to your app settings in Streamlit Cloud
+2. Click on "Secrets" in the left sidebar
+3. Add the following secret:
+   ```toml
+   password = "your-secure-password-here"
+   ```
+4. Save and redeploy your app
+
+### For Local Development:
+
+Set the `DASHBOARD_PASSWORD` environment variable:
+```bash
+export DASHBOARD_PASSWORD="your-secure-password-here"
+streamlit run app.py
+```
+
+Or create a `.streamlit/secrets.toml` file (this file is already in `.gitignore`):
+```toml
+password = "your-secure-password-here"
+```
+
+**Note**: If no password is configured, the app will show a warning but allow access (useful for development).
+
 ## Troubleshooting
 
 - **No data found**: Verify wallet addresses are valid and have activity in the selected date range
 - **API errors**: Check network connection and API availability
 - **Import errors**: Ensure all dependencies are installed: `pip install -r requirements.txt`
+- **Authentication issues**: Make sure the password is set correctly in Streamlit Cloud secrets or environment variables
 

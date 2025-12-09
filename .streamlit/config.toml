@@ -1,7 +1,11 @@
 [server]
 headless = true
 port = 8501
+enableXsrfProtection = false
 
 [browser]
 gatherUsageStats = false
+
+
+
 

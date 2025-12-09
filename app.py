@@ -28,59 +28,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Authentication
-def check_password():
-    """Check if user is authenticated"""
-    # Initialize authentication state
-    if 'authenticated' not in st.session_state:
-        st.session_state.authenticated = False
-    
-    # If already authenticated, return True
-    if st.session_state.authenticated:
-        return True
-    
-    # Get password from secrets (for Streamlit Cloud) or environment variable
-    try:
-        # Try to get password from Streamlit secrets (for deployed app)
-        correct_password = st.secrets.get("password", None)
-    except (AttributeError, FileNotFoundError):
-        # Fallback to environment variable or default (for local development)
-        import os
-        correct_password = os.getenv("DASHBOARD_PASSWORD", None)
-    
-    # If no password is set, allow access (for development)
-    if correct_password is None:
-        st.warning("⚠️ No password configured. Set DASHBOARD_PASSWORD environment variable or add to Streamlit secrets.")
-        return True
-    
-    # Show login form
-    st.title("🔐 Authentication Required")
-    st.markdown("Please enter the password to access the Silhouette Growth Dashboard.")
-    
-    password_input = st.text_input("Password", type="password", key="password_input")
-    
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        login_button = st.button("Login", type="primary")
-    
-    if login_button:
-        if password_input == correct_password:
-            st.session_state.authenticated = True
-            st.rerun()
-        else:
-            st.error("❌ Incorrect password. Please try again.")
-            return False
-    
-    # Show logout option if somehow authenticated but showing login
-    if st.session_state.authenticated:
-        return True
-    
-    st.stop()
-    return False
-
-# Check authentication before showing the app
-if not check_password():
-    st.stop()
+# Authentication is handled by Streamlit Cloud - no password check needed
 
 # Rate limiting: Very conservative 3 requests per second to stay safely under 10 req/s limit
 RATE_LIMIT = 3
@@ -680,13 +628,6 @@ st.markdown("Analyze wallet demographics and activity on Silhouette (Hyperliquid
 
 # Sidebar
 with st.sidebar:
-    # Logout button at the top
-    if st.button("🚪 Logout", use_container_width=True, type="secondary"):
-        st.session_state.authenticated = False
-        st.rerun()
-    
-    st.divider()
-    
     st.header("⚙️ Configuration")
     
     # Wallet addresses input
